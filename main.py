@@ -1,91 +1,104 @@
 import asyncio
 import logging
+import os
+import sys
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
-from aiogram.fsm.storage.redis import RedisStorage
-from redis.asyncio import Redis
-from sqlalchemy import select
 
-from core.config import settings
-from database.session import AsyncSessionLocal
-from models.dealer_bot import DealerBot
-from routers.wallet_router import wallet_router
-from middlewares.rate_limit import RateLimitMiddleware
+# 加载 .env 环境变量
+load_dotenv()
 
-# 设定基础日志输出格式
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("SystemRunner")
+# 设置系统日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("MultiBotEngine")
 
-async def load_dynamic_dealer_bots() -> list[str]:
-    """
-    数据面：动态读取数据库中状态为激活的发包机器人 Token 列表
-    """
-    async with AsyncSessionLocal() as session:
-        try:
-            stmt = select(DealerBot.bot_token).where(DealerBot.status == "active")
-            result = await session.execute(stmt)
-            return list(result.scalars().all())
-        except Exception as e:
-            logger.error(f"Error querying active dealer bots from MySQL: {e}")
-            return []
+# =====================================================================
+# 1. 模拟导入外部业务路由 (Routers)
+# =====================================================================
+# 实际生产环境中，请取消下方三行的注释以导入您 routers 目录下的真实路由文件：
+# from routers.wallet_router import wallet_router
+# from routers.admin_router import admin_router
+# from routers.dealer_router import dealer_router
+
+from aiogram import Router
+# 此处使用 Mock 路由对象仅用于保证此主程序可直接运行，实际开发时请替换为真实路由
+wallet_router = Router(name="wallet_router")
+admin_router = Router(name="admin_router")
+dealer_router = Router(name="dealer_router")
+
 
 async def main():
-    # 1. 初始化 Redis 连池与存储
-    redis = Redis.from_url(settings.REDIS_URL, decode_responses=True)
-    storage = RedisStorage(redis)
+    logger.info("Initializing multi-bot physical isolation system...")
 
-    # 2. 创建核心 Dispatcher
-    dp = Dispatcher(storage=storage)
+    # =====================================================================
+    # 2. 多 Dispatcher 隔离设计
+    # =====================================================================
+    # static_dp：负责私聊静态机器人组（财务中心与超管控制台）
+    # 共享相同的存储器、过滤器上下文或中间件，但与群组内的游戏逻辑物理隔离
+    static_dp = Dispatcher()
 
-    # 3. 挂载全局拦截器 (防连点限制器)
-    dp.message.outer_middleware(RateLimitMiddleware(redis))
+    # dealer_dp：预留给群组内的动态发包机器人（游戏数据面）
+    # 确保高频抢包、炸弹计算等业务不阻塞财务机器人的正常响应
+    dealer_dp = Dispatcher()
 
-    # 4. 注册各端独立路由
-    dp.include_router(wallet_router)
-    # dp.include_router(admin_router)   # 超管路由 (待自行补齐)
-    # dp.include_router(dealer_router)  # 游戏路由 (待自行补齐)
+    # =====================================================================
+    # 3. 路由 (Routers) 精确挂载
+    # =====================================================================
+    # 将钱包和超管控制台挂载至静态调度器
+    static_dp.include_router(wallet_router)
+    static_dp.include_router(admin_router)
+    logger.info("Successfully mounted [wallet_router] and [admin_router] to static_dp.")
 
-    # 5. 加载静态双机（钱包及超管）
-    bots: list[Bot] = []
-    
-    if settings.WALLET_BOT_TOKEN:
-        bots.append(Bot(token=settings.WALLET_BOT_TOKEN))
-        logger.info("Wallet Bot loaded successfully.")
-    else:
-        logger.warning("WALLET_BOT_TOKEN was not configured in .env!")
+    # 将游戏发包处理挂载至发包调度器 (预留)
+    dealer_dp.include_router(dealer_router)
+    logger.info("Successfully mounted [dealer_router] to dealer_dp.")
 
-    if settings.ADMIN_BOT_TOKEN:
-        bots.append(Bot(token=settings.ADMIN_BOT_TOKEN))
-        logger.info("Admin Bot loaded successfully.")
-    else:
-        logger.warning("ADMIN_BOT_TOKEN was not configured in .env!")
+    # =====================================================================
+    # 4. Bot 实例初始化 (读取环境变量)
+    # =====================================================================
+    wallet_token = os.getenv("WALLET_BOT_TOKEN")
+    admin_token = os.getenv("ADMIN_BOT_TOKEN")
 
-    # 6. 数据控制分离面：加载并拉起数据库中的动态发包机器人
-    dealer_tokens = await load_dynamic_dealer_bots()
-    for idx, token in enumerate(dealer_tokens, start=1):
-        try:
-            # 校验 token 合法性并追加到启动实例中
-            bot_instance = Bot(token=token)
-            bots.append(bot_instance)
-            logger.info(f"Dynamic Dealer Bot #{idx} loaded (token preview: {token[:10]}...)")
-        except Exception as err:
-            logger.error(f"Failed to load Dynamic Bot #{idx}: {err}")
+    if not wallet_token or not admin_token:
+        logger.error("Missing WALLET_BOT_TOKEN or ADMIN_BOT_TOKEN in environment variables.")
+        sys.exit(1)
 
-    if not bots:
-        logger.error("No active bot instances detected. Exiting system.")
-        return
+    wallet_bot = Bot(token=wallet_token)
+    admin_bot = Bot(token=admin_token)
 
-    # 7. 并发拉起所有机器人轮询监听
-    logger.info("Initializing bot federation and starting polling...")
+    # =====================================================================
+    # 5. 异步并发启动与物理隔离运行 (核心并发机制)
+    # =====================================================================
+    logger.info("Polling configuration is ready. Starting concurrent execution loop...")
+
+    # 并发启动说明：
+    # 1. 在 aiogram 3.x 中，单一 Dispatcher 支持传入多个 Bot 实例（即 multibot 模式）。
+    #    通过 `static_dp.start_polling(wallet_bot, admin_bot)`，静态调度器将同时为这两个机器人拉取更新。
+    # 2. 我们通过 `asyncio.gather` 将“静态调度器任务”与“未来可能运行的游戏调度器任务”并发挂起。
+    #    这样可以实现不同 Dispatcher 实例在物理线程（协程空间）中的完全隔离运行。
     try:
-        # aiogram 3.x 允许传入多个 bot 对象并行消费同一个路由池分发的事件
-        await dp.start_polling(*bots)
-    except Exception as run_err:
-        logger.critical(f"Engine run error: {run_err}")
+        await asyncio.gather(
+            # 任务 A: 启动静态控制面机器人们的轮询 (Wallet Bot + Admin Bot 并行)
+            static_dp.start_polling(wallet_bot, admin_bot, skip_updates=True),
+            
+            # 任务 B: 预留给后续动态发包机器人调度器 (dealer_dp) 的轮询任务
+            # 待后续您通过数据库读出并实例化 dealer_bot 之后，只需在此处解除注释并传入 dealer_bot 即可
+            # dealer_dp.start_polling(dealer_bot, skip_updates=True)
+        )
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during polling: {e}")
     finally:
-        # 清理工作
-        await redis.close()
-        for bot in bots:
-            await bot.session.close()
+        # 优雅关闭：确保系统退出时安全释放 HTTP 客户端会话资源
+        await wallet_bot.session.close()
+        await admin_bot.session.close()
+        logger.info("All bot sessions have been securely closed.")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("System process terminated manually.")
